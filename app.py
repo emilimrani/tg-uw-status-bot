@@ -50,7 +50,16 @@ def get_fernet() -> Fernet:
 def enc(text: str) -> bytes:
     return get_fernet().encrypt(text.encode("utf-8"))
 
-def dec(blob: bytes) -> str:
+def dec(blob) -> str:
+    if blob is None:
+        raise RuntimeError("В базе нет сохранённых данных.")
+    # Приводим всё к bytes (psycopg может вернуть memoryview/bytearray/str)
+    if isinstance(blob, memoryview):
+        blob = blob.tobytes()
+    elif isinstance(blob, bytearray):
+        blob = bytes(blob)
+    elif isinstance(blob, str):
+        blob = blob.encode("utf-8")
     return get_fernet().decrypt(blob).decode("utf-8")
 
 # ---------- DB ----------
