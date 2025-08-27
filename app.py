@@ -329,15 +329,12 @@ def main_kb(has_creds: bool, alerts: bool) -> InlineKeyboardMarkup:
     rows = []
     if has_creds:
         rows.append([InlineKeyboardButton("🔍 Проверить статус", callback_data="check")])
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    ("🔔 Уведомления: ВКЛ" if alerts else "🔕 Уведомления: ВЫКЛ"),
-                    callback_data="alerts_toggle",
-                )
-            ]
-        )
+        rows.append([InlineKeyboardButton(
+            "🔔 Уведомления: ВКЛ" if alerts else "🔕 Уведомления: ВЫКЛ",
+            callback_data="alerts_toggle"
+        )])
         rows.append([InlineKeyboardButton("🔑 Изменить данные", callback_data="connect")])
         rows.append([InlineKeyboardButton("🗑 Удалить данные", callback_data="unlink")])
     else:
-        rows.append([InlineKeyboardButton("🔑 Подключить де]()
+        rows.append([InlineKeyboardButton("🔑 Подключить дело", callback_data="connect")])
+    return InlineKeyboardMarkup(rows)
