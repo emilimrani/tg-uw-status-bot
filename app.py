@@ -1,11 +1,20 @@
-import os, re
+import os, re, time, logging
 from contextlib import suppress
+from dataclasses import dataclass
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+from cryptography.fernet import Fernet, InvalidToken
+
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes, CallbackQueryHandler,
+    ConversationHandler, MessageHandler, filters
+)
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
-# --------- ENV ---------
+# ---------- ENV ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 BROWSERLESS_WS = os.getenv("BROWSERLESS_WS")  # wss://production-ams.browserless.io/?token=...
 PUBLIC_URL = os.getenv("PUBLIC_URL")          # https://your-service.onrender.com
@@ -13,15 +22,88 @@ WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN")  # any long random stri
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH") or (f"webhook/{WEBHOOK_SECRET_TOKEN or 'changeme'}")
 PORT = int(os.getenv("PORT", "8000"))
 
+DATABASE_URL = os.getenv("DATABASE_URL")  # Render Postgres (Internal Connection String)
+SECRET_KEY = os.getenv("SECRET_KEY")      # Fernet key: 32 urlsafe base64 bytes; generate once
+
 LOGIN_URL = "https://klient.gdansk.uw.gov.pl"
 
-# --------- scraping ---------
+# ---------- LOG ----------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("bot")
+
+# ---------- Encryption helpers ----------
+def get_fernet() -> Fernet:
+    if not SECRET_KEY:
+        raise RuntimeError("SECRET_KEY не задан. Сгенерируйте через: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\"")
+    return Fernet(SECRET_KEY)
+
+def enc(text: str) -> bytes:
+    return get_fernet().encrypt(text.encode("utf-8"))
+
+def dec(blob: bytes) -> str:
+    return get_fernet().decrypt(blob).decode("utf-8")
+
+# ---------- DB helpers ----------
+def db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL не задан (Render Postgres).")
+    return psycopg2.connect(DATABASE_URL, sslmode="require", cursor_factory=RealDictCursor)
+
+def ensure_schema():
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            create table if not exists users (
+                telegram_id  bigint primary key,
+                case_enc     bytea not null,
+                pass_enc     bytea not null,
+                alerts       boolean not null default false,
+                created_at   timestamptz not null default now(),
+                updated_at   timestamptz not null default now()
+            );
+        """)
+        conn.commit()
+
+@dataclass
+class Creds:
+    case_no: str
+    password: str
+    alerts: bool
+
+def get_creds(telegram_id: int) -> Creds | None:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("select case_enc, pass_enc, alerts from users where telegram_id=%s", (telegram_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        try:
+            return Creds(dec(row["case_enc"]), dec(row["pass_enc"]), row["alerts"])
+        except InvalidToken:
+            return None
+
+def upsert_creds(telegram_id: int, case_no: str, password: str):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            insert into users(telegram_id, case_enc, pass_enc)
+            values(%s, %s, %s)
+            on conflict (telegram_id) do update set
+              case_enc=excluded.case_enc, pass_enc=excluded.pass_enc, updated_at=now();
+        """, (telegram_id, enc(case_no), enc(password)))
+        conn.commit()
+
+def set_alerts(telegram_id: int, enabled: bool):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("update users set alerts=%s, updated_at=now() where telegram_id=%s", (enabled, telegram_id))
+        conn.commit()
+
+def delete_user(telegram_id: int):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("delete from users where telegram_id=%s", (telegram_id,))
+        conn.commit()
+
+# ---------- Scraper ----------
 async def fetch_status(case_no: str, password: str) -> str:
-    """
-    Opens the portal, logs in and extracts the text near the label 'Etap postępowania'.
-    """
     if not BROWSERLESS_WS:
-        raise RuntimeError("Переменная окружения BROWSERLESS_WS не задана. См. инструкции.")
+        raise RuntimeError("BROWSERLESS_WS не задан.")
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(BROWSERLESS_WS)
         context = await browser.new_context(
@@ -36,7 +118,7 @@ async def fetch_status(case_no: str, password: str) -> str:
             with suppress(Exception):
                 await page.get_by_role("button", name=re.compile("Akceptuj|Zgadzam|Accept", re.I)).click(timeout=3000)
 
-            # fill "Numer sprawy"
+            # Fill fields
             filled = False
             for locator in [
                 page.get_by_label(re.compile(r"Numer sprawy", re.I)),
@@ -44,15 +126,10 @@ async def fetch_status(case_no: str, password: str) -> str:
                 page.locator("input[name*='numer' i], input[id*='numer' i]"),
             ]:
                 try:
-                    await locator.fill(case_no, timeout=3000)
-                    filled = True
-                    break
-                except Exception:
-                    pass
-            if not filled:
-                raise RuntimeError("Не нашёл поле 'Numer sprawy' — возможно, изменилась страница.")
+                    await locator.fill(case_no, timeout=2500); filled=True; break
+                except Exception: pass
+            if not filled: raise RuntimeError("Не нашёл поле 'Numer sprawy'.")
 
-            # fill "Hasło"
             filled = False
             for locator in [
                 page.get_by_label(re.compile(r"Hasło", re.I)),
@@ -60,36 +137,25 @@ async def fetch_status(case_no: str, password: str) -> str:
                 page.locator("input[type='password']"),
             ]:
                 try:
-                    await locator.fill(password, timeout=3000)
-                    filled = True
-                    break
-                except Exception:
-                    pass
-            if not filled:
-                raise RuntimeError("Не нашёл поле 'Hasło' — возможно, изменилась страница.")
+                    await locator.fill(password, timeout=2500); filled=True; break
+                except Exception: pass
+            if not filled: raise RuntimeError("Не нашёл поле 'Hasło'.")
 
-            # click "Zaloguj"
-            clicked = False
+            clicked=False
             for locator in [
                 page.get_by_role("button", name=re.compile(r"Zaloguj|Zalogować|Log in", re.I)),
                 page.locator("input[type='submit']"),
                 page.locator("button[type='submit']"),
             ]:
                 try:
-                    await locator.click(timeout=3000)
-                    clicked = True
-                    break
-                except Exception:
-                    pass
-            if not clicked:
-                raise RuntimeError("Не удалось нажать кнопку входа.")
+                    await locator.click(timeout=2500); clicked=True; break
+                except Exception: pass
+            if not clicked: raise RuntimeError("Не удалось нажать 'Zaloguj'.")
 
             await page.wait_for_load_state("domcontentloaded", timeout=30000)
-
             with suppress(Exception):
-                err = await page.get_by_text(re.compile(r"(błędne|nieprawidłow).*hasł|logow", re.I)).inner_text(timeout=1500)
-                if err:
-                    raise RuntimeError("Błąd logowania: sprawdź numer sprawy i hasło.")
+                err = await page.get_by_text(re.compile(r"(błędne|nieprawidłow).*hasł|logow", re.I)).inner_text(timeout=1200)
+                if err: raise RuntimeError("Błąd logowania: sprawdź numer sprawy i hasło.")
 
             await page.wait_for_selector("text=Etap postępowania", timeout=15000)
 
@@ -98,76 +164,177 @@ async def fetch_status(case_no: str, password: str) -> str:
                 text = await page.locator(
                     "xpath=(//*[contains(normalize-space(.),'Etap postępowania')])[1]"
                     "/following::*[self::span or self::div or self::td or self::p][1]"
-                ).inner_text(timeout=2500)
+                ).inner_text(timeout=2000)
             if not text:
                 container = await page.locator(
                     "xpath=(//*[contains(normalize-space(.),'Etap postępowania')])[1]/ancestor::*[self::tr or self::div][1]"
-                ).inner_text(timeout=2500)
-                import re as _re
-                text = _re.sub(r".*Etap postępowania[:\\s]*", "", container, flags=_re.S|_re.I).strip()
+                ).inner_text(timeout=2000)
+                text = re.sub(r".*Etap postępowania[:\s]*", "", container, flags=re.S|re.I).strip()
 
-            import re as _re
-            text = _re.sub(r"\\s+", " ", (text or "")).strip()
+            text = re.sub(r"\s+", " ", (text or "")).strip()
             if not text:
-                raise RuntimeError("Не удалось найти текст статуса. Возможно, изменилась разметка портала.")
+                raise RuntimeError("Не удалось найти текст статуса.")
             return text
 
         except PlaywrightTimeout:
-            raise RuntimeError("Портал не отвечает или работает медленно. Попробуйте ещё раз позже.")
+            raise RuntimeError("Портал не отвечает или работает медленно. Попробуйте позже.")
         finally:
             await context.close()
 
-# --------- telegram handlers ---------
-def parse_args(txt: str):
-    parts = re.split(r"\\s+", txt.strip(), maxsplit=2)
-    if len(parts) >= 3:
-        return parts[1], parts[2]
-    raise ValueError("Формат: /status <NUMER_SPRAWY> <HASLO>")
+# ---------- UI ----------
+AWAIT_CASE, AWAIT_PASS = range(2)
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Пришли команду:\\n"
-        "/status <NUMER_SPRAWY> <HASLO>\\n\\n"
-        "Я залогинюсь на портале и верну текущий 'Etap postępowania'. "
-        "Ничего не сохраняю."
+def main_kb(has_creds: bool, alerts: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if has_creds:
+        rows.append([InlineKeyboardButton("🔍 Проверить статус", callback_data="check")])
+        rows.append([InlineKeyboardButton(("🔔 Уведомления: ВКЛ" if alerts else "🔕 Уведомления: ВЫКЛ"),
+                                          callback_data="alerts_toggle")])
+        rows.append([InlineKeyboardButton("🔑 Изменить данные", callback_data="connect")])
+        rows.append([InlineKeyboardButton("🗑 Удалить данные", callback_data="unlink")])
+    else:
+        rows.append([InlineKeyboardButton("🔑 Подключить дело", callback_data="connect")])
+    return InlineKeyboardMarkup(rows)
+
+async def greet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    creds = get_creds(uid)
+    text = (
+        "Привет! Я буду присылать статус по твоему делу в воеводском ужонде.\n\n"
+        "• Нажми «🔑 Подключить дело», чтобы один раз сохранить *номер дела* и *пароль*.\n"
+        "• Потом просто жми «🔍 Проверить статус» — я зайду на портал и пришлю *Etap postępowania*.\n"
+        "• Данные шифруются и хранятся в базе. Можно удалить в один клик."
     )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_kb(bool(creds), creds.alerts if creds else False))
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        case_no, password = parse_args(update.message.text)
-    except ValueError as e:
-        await update.message.reply_text(str(e))
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    data = query.data
+
+    if data == "connect":
+        context.user_data["connect"] = {}
+        await query.edit_message_text("Введи *номер дела* (Numer sprawy):", parse_mode="Markdown")
+        return AWAIT_CASE
+
+    if data == "check":
+        creds = get_creds(uid)
+        if not creds:
+            await query.edit_message_text("Сначала подключи дело: нажми «🔑 Подключить дело».", reply_markup=main_kb(False, False))
+            return ConversationHandler.END
+        await query.edit_message_text("⏳ Проверяю статус...")
+        try:
+            stage = await fetch_status(creds.case_no, creds.password)
+            await query.edit_message_text(f"📌 Etap postępowania: *{stage}*", parse_mode="Markdown",
+                                          reply_markup=main_kb(True, creds.alerts))
+        except Exception as e:
+            await query.edit_message_text(f"⚠️ {e}", reply_markup=main_kb(True, creds.alerts))
+        return ConversationHandler.END
+
+    if data == "alerts_toggle":
+        creds = get_creds(uid)
+        if not creds:
+            await query.edit_message_text("Сначала подключи дело.", reply_markup=main_kb(False, False))
+            return ConversationHandler.END
+        new_state = not creds.alerts
+        set_alerts(uid, new_state)
+        # schedule/cancel job
+        if new_state:
+            # every 6 hours
+            context.job_queue.run_repeating(check_job, interval=6*60*60, first=10, name=f"alert_{uid}", data=uid)
+        else:
+            for job in context.job_queue.get_jobs_by_name(f"alert_{uid}"):
+                job.schedule_removal()
+        await query.edit_message_text(
+            "Уведомления " + ("включены. Я буду проверять статус каждые ~6 часов." if new_state else "выключены."),
+            reply_markup=main_kb(True, new_state)
+        )
+        return ConversationHandler.END
+
+    if data == "unlink":
+        delete_user(uid)
+        # cancel jobs
+        for job in context.job_queue.get_jobs_by_name(f"alert_{uid}"):
+            job.schedule_removal()
+        await query.edit_message_text("Данные удалены. Нажми «🔑 Подключить дело», чтобы добавить заново.",
+                                      reply_markup=main_kb(False, False))
+        return ConversationHandler.END
+
+    return ConversationHandler.END
+
+async def ask_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # got case no
+    case_no = update.message.text.strip()
+    context.user_data["connect"]["case_no"] = case_no
+    await update.message.reply_text("Принято. Теперь отправь *пароль* (Hasło):", parse_mode="Markdown")
+    return AWAIT_PASS
+
+async def save_creds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    pwd = update.message.text.strip()
+    case_no = context.user_data.get("connect", {}).get("case_no")
+    if not case_no:
+        await update.message.reply_text("Что-то пошло не так. Начни заново: нажми «🔑 Подключить дело».")
+        return ConversationHandler.END
+    upsert_creds(uid, case_no, pwd)
+    await update.message.reply_text("Готово! Данные сохранены.\nТеперь просто жми «🔍 Проверить статус».",
+                                    reply_markup=main_kb(True, False))
+    return ConversationHandler.END
+
+async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Окей, отменил.", reply_markup=main_kb(False, False))
+    return ConversationHandler.END
+
+# ---------- Background job ----------
+async def check_job(context: ContextTypes.DEFAULT_TYPE):
+    uid = context.job.data
+    creds = get_creds(uid)
+    if not creds or not creds.alerts:
         return
-
-    msg = await update.message.reply_text("⏳ Проверяю статус на портале...")
     try:
-        stage = await fetch_status(case_no, password)
-        await msg.edit_text(f"📌 Etap postępowania: *{stage}*", parse_mode="Markdown")
+        stage = await fetch_status(creds.case_no, creds.password)
+        await context.bot.send_message(chat_id=uid, text=f"🔔 Обновление статуса:\n📌 *{stage}*", parse_mode="Markdown",
+                                       reply_markup=main_kb(True, True))
     except Exception as e:
-        await msg.edit_text(f"⚠️ {e}")
+        # Send only once in a while to avoid spam
+        await context.bot.send_message(chat_id=uid, text=f"⚠️ Не удалось проверить статус: {e}", reply_markup=main_kb(True, True))
 
-# --------- main (Webhook mode) ---------
+# ---------- main ----------
 def main():
-    if not TELEGRAM_TOKEN:
-        raise SystemExit("TELEGRAM_TOKEN не задан.")
-    if not PUBLIC_URL or not PUBLIC_URL.startswith("https://"):
-        raise SystemExit("PUBLIC_URL не задан или не начинается с https:// (см. инструкции).")
-    if not WEBHOOK_SECRET_TOKEN:
-        raise SystemExit("WEBHOOK_SECRET_TOKEN не задан. Задайте любой длинный случайный текст.")
+    if not TELEGRAM_TOKEN: raise SystemExit("TELEGRAM_TOKEN не задан.")
+    if not PUBLIC_URL or not PUBLIC_URL.startswith("https://"): raise SystemExit("PUBLIC_URL должен начинаться с https://")
+    if not WEBHOOK_SECRET_TOKEN: raise SystemExit("WEBHOOK_SECRET_TOKEN не задан.")
+    ensure_schema()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
 
-    # This will set the webhook with Telegram on startup and start an HTTPS webhook listener
+    # /start
+    app.add_handler(CommandHandler("start", greet))
+
+    # Buttons
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(on_button)],
+        states={
+            AWAIT_CASE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_pass)],
+            AWAIT_PASS:[MessageHandler(filters.TEXT & ~filters.COMMAND, save_creds)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+        map_to_parent={},
+    )
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(on_button))
+
+    # Webhook
     app.run_webhook(
         listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_PATH,  # local path
-        webhook_url=f"{PUBLIC_URL.rstrip('/')}/{WEBHOOK_PATH}",  # full public URL
+        port=int(os.getenv("PORT", "8000")),
+        url_path=WEBHOOK_PATH,
+        webhook_url=f"{PUBLIC_URL.rstrip('/')}/{WEBHOOK_PATH}",
         secret_token=WEBHOOK_SECRET_TOKEN,
         drop_pending_updates=True,
     )
 
 if __name__ == "__main__":
     main()
+
