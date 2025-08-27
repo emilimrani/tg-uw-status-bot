@@ -47,12 +47,10 @@ log = logging.getLogger("bot")
 
 # ---------- helpers ----------
 def safe_markdown(text: str) -> str:
-    """Грубое экранирование для Markdown."""
     return text.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
 
 
 async def safe_edit_or_send(query, text, reply_markup=None, parse_mode="Markdown"):
-    """Пробуем отредактировать исходное сообщение; если нельзя — шлём новое."""
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except Exception as e:
@@ -73,7 +71,7 @@ def enc(text: str) -> bytes:
 
 
 def dec(blob) -> str:
-    """Надёжно превращаем bytea в bytes и расшифровываем."""
+    """Надёжно приводим bytea → bytes и расшифровываем."""
     if blob is None:
         raise RuntimeError("В базе нет сохранённых данных.")
     if isinstance(blob, memoryview):
@@ -125,7 +123,6 @@ def get_creds(telegram_id: int) -> Creds | None:
         try:
             return Creds(dec(row["case_enc"]), dec(row["pass_enc"]), row["alerts"])
         except InvalidToken:
-            # ключ поменяли — проще попросить ввести заново
             return None
 
 
@@ -160,14 +157,13 @@ def delete_user(telegram_id: int):
 # ---------- Scraper ----------
 async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
     """
-    Возвращает текст статуса или ('screenshot', image_bytes),
-    если текст не удалось распарсить (но логин прошёл).
+    Возвращает текст статуса или ('screenshot', image_bytes), если текст не распарсился.
     """
     if not BROWSERLESS_WS:
         raise RuntimeError("BROWSERLESS_WS не задан.")
 
     async with async_playwright() as p:
-        # 0) Подключение к удалённому браузеру
+        # Подключаемся к удалённому браузеру
         try:
             browser = await p.chromium.connect_over_cdp(BROWSERLESS_WS)
         except Exception as e:
@@ -187,16 +183,16 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
         page = await context.new_page()
 
         try:
-            # 1) Переход на логин
+            # 1) Заходим на страницу логина
             await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
 
-            # Cookie banner
+            # Принять cookies, если есть
             with suppress(Exception):
                 await page.get_by_role(
                     "button", name=re.compile("Akceptuj|Zgadzam|Accept|Zgoda", re.I)
                 ).click(timeout=3000)
 
-            # 2) Numer sprawy
+            # 2) Поле "Numer sprawy"
             filled = False
             for locator in [
                 page.get_by_label(re.compile(r"Numer sprawy", re.I)),
@@ -212,7 +208,7 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
             if not filled:
                 raise RuntimeError("Не нашёл поле 'Numer sprawy'.")
 
-            # 3) Hasło
+            # 3) Поле "Hasło"
             filled = False
             for locator in [
                 page.get_by_label(re.compile(r"Hasło", re.I)),
@@ -228,7 +224,7 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
             if not filled:
                 raise RuntimeError("Не нашёл поле 'Hasło'.")
 
-            # 4) Zaloguj
+            # 4) Кнопка "Zaloguj"
             clicked = False
             for locator in [
                 page.get_by_role("button", name=re.compile(r"Zaloguj|Zalogować|Log in|Zaloguj się", re.I)),
@@ -246,7 +242,7 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
 
             await page.wait_for_load_state("domcontentloaded", timeout=45000)
 
-            # 5) Явная ошибка логина
+            # 5) Очевидные ошибки логина
             with suppress(Exception):
                 err = await page.get_by_text(
                     re.compile(r"(błędne|nieprawidłow).*hasł|logow|błąd logowania", re.I)
@@ -254,62 +250,64 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
                 if err:
                     raise RuntimeError("Błąd logowania: sprawdź numer sprawy и hasło.")
 
-            # 6) Достаём «Etap postępowania»
-            # (A) Таблица: <td>label</td><td>value</td>
-            labels = ["Etap postępowania", "Etap postepowania", "Status sprawy", "Stage of proceedings"]
-            for lab in labels:
-                for xp in [
-                    f"xpath=//td[normalize-space()='{lab}']/following-sibling::td[1]",
-                    f"xpath=//th[normalize-space()='{lab}']/following-sibling::td[1]",
-                    f"xpath=//td[contains(normalize-space(),'{lab}')]/following-sibling::td[1]",
-                    f"xpath=//th[contains(normalize-space(),'{lab}')]/following-sibling::td[1]",
-                ]:
-                    with suppress(Exception):
-                        txt = await page.locator(xp).inner_text(timeout=2000)
-                        txt = re.sub(r"\s+", " ", (txt or "")).strip()
-                        if txt:
-                            return txt
+            # 6) Достаём «Etap postępowania» — надёжно через JS
+            # Ищем ячейку таблицы с надписью и берём значение из соседней ячейки.
+            status_text = await page.evaluate(
+                """
+                () => {
+                  const norm = s => (s || "")
+                    .toString()
+                    .normalize("NFKD")
+                    .replace(/[\\u0300-\\u036f]/g, "")
+                    .toLowerCase()
+                    .replace(/\\s+/g, " ")
+                    .trim();
 
-            # (B) Разная разметка: берём ближайший «ряд» к метке и значение после неё
-            with suppress(Exception):
-                row = page.locator(
-                    "xpath=(//*[contains(normalize-space(.),'Etap postępowania') or "
-                    "contains(normalize-space(.),'Etap postepowania') or "
-                    "contains(normalize-space(.),'Status sprawy') or "
-                    "contains(normalize-space(.),'Stage of proceedings')])[1]"
-                    "/ancestor::*[self::tr or self::div[contains(@class,'row') or contains(@class,'form')]][1]"
-                )
-                txt = await row.inner_text(timeout=2000)
-                txt = re.sub(
-                    r".*?(Etap post[ęe]powania|Status sprawy|Stage of proceedings)\s*",
-                    "",
-                    txt,
-                    flags=re.I | re.S,
-                )
-                txt = re.split(r"\n+", txt, 1)[0]
-                txt = re.sub(r"\s+", " ", txt).strip()
-                if txt:
-                    return txt
+                  const labels = ["etap postepowania", "status sprawy", "stage of proceedings"];
 
-            # (C) Запасные селекторы
-            # (без XPath 2.0 — только то, что работает в Chromium/XPath 1.0)
-            selectors = [
-                "xpath=(//*[contains(normalize-space(.),'Etap postępowania')])[1]/following::*[self::span|self::div|self::td|self::p][1]",
-                "[data-test*='etap' i], [data-testid*='etap' i]",
-                # Проще: ищем первый элемент, где есть ключевая фраза, и берём следующий текстовый блок
-                "xpath=(//*[contains(translate(normalize-space(.),'ĄĆĘŁŃÓŚŹŻąćęłńóśźż','ACELNOSZZacelnoszz'),'Etap postepowania') or "
-                "contains(translate(normalize-space(.),'ĄĆĘŁŃÓŚŹŻąćęłńóśźż','ACELNOSZZacelnoszz'),'Status sprawy') or "
-                "contains(translate(normalize-space(.),'ĄĆĘŁŃÓŚŹŻąćęłńóśźż','ACELNOSZZacelnoszz'),'Stage of proceedings')])[1]"
-                "/following::*[self::span|self::div|self::td|self::p][1]",
-            ]
-            for sel in selectors:
-                with suppress(Exception):
-                    txt = await page.locator(sel).inner_text(timeout=2000)
-                    txt = re.sub(r"\s+", " ", (txt or "")).strip()
-                    if txt:
-                        return txt
+                  const isLabel = el => {
+                    const t = norm(el.innerText);
+                    return labels.some(l => t.includes(l));
+                  };
 
-            # 7) Если совсем ничего — пришлём скрин
+                  // 1) Табличные ячейки <td>/<th>
+                  const cells = Array.from(document.querySelectorAll("td,th"));
+                  for (const el of cells) {
+                    if (isLabel(el)) {
+                      const row = el.closest("tr");
+                      if (row) {
+                        const rowCells = Array.from(row.querySelectorAll("td,th"));
+                        const idx = rowCells.indexOf(el);
+                        for (let j = idx + 1; j < rowCells.length; j++) {
+                          const raw = (rowCells[j].innerText || "").trim();
+                          if (raw) return raw;
+                        }
+                      }
+                    }
+                  }
+
+                  // 2) Произвольная разметка: рядом следующий значимый блок
+                  const els = Array.from(document.querySelectorAll("label,div,span,p,dt,dd,strong,b,em"));
+                  for (const el of els) {
+                    if (isLabel(el)) {
+                      let sib = el.nextElementSibling;
+                      for (let i = 0; i < 4 && sib; i++) {
+                        const raw = (sib.innerText || "").trim();
+                        if (raw) return raw;
+                        sib = sib.nextElementSibling;
+                      }
+                    }
+                  }
+
+                  return null;
+                }
+                """
+            )
+
+            if status_text and isinstance(status_text, str):
+                return re.sub(r"\s+", " ", status_text).strip()
+
+            # 7) Если не нашли — пришлём скриншот
             img = await page.screenshot(full_page=True)
             return ("screenshot", img)
 
