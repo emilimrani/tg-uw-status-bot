@@ -195,48 +195,54 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
                 err = await page.get_by_text(re.compile(r"(błędne|nieprawidłow).*hasł|logow|błąd logowania", re.I)).inner_text(timeout=1500)
                 if err: raise RuntimeError("Błąd logowania: sprawdź numer sprawy и hasło.")
 
-            # --- Ищем «Etap postępowania» ---
-            labels = ["Etap postępowania", "Etap postepowania", "Status sprawy", "Stage of proceedings"]
+# --- ИЩЕМ "Etap postępowania" НАДЁЖНО ---
+labels = [
+    "Etap postępowania", "Etap postepowania",
+    "Status sprawy", "Stage of proceedings"
+]
 
-            # (A) таблица: <td>label</td><td>value</td>
-            for lab in labels:
-                for xp in [
-                    f"xpath=//td[normalize-space()='{lab}']/following-sibling::td[1]",
-                    f"xpath=//th[normalize-space()='{lab}']/following-sibling::td[1]",
-                    f"xpath=//td[contains(normalize-space(),'{lab}')]/following-sibling::td[1]",
-                    f"xpath=//th[contains(normalize-space(),'{lab}')]/following-sibling::td[1]",
-                ]:
-                    with suppress(Exception):
-                        txt = await page.locator(xp).inner_text(timeout=2000)
-                        txt = re.sub(r\"\\s+\", \" \", (txt or \"\")).strip()
-                        if txt: return txt
+# (A) Таблица: <td>label</td><td>value</td>
+for lab in labels:
+    for xp in [
+        f"xpath=//td[normalize-space()='{lab}']/following-sibling::td[1]",
+        f"xpath=//th[normalize-space()='{lab}']/following-sibling::td[1]",
+        f"xpath=//td[contains(normalize-space(),'{lab}')]/following-sibling::td[1]",
+        f"xpath=//th[contains(normalize-space(),'{lab}')]/following-sibling::td[1]",
+    ]:
+        with suppress(Exception):
+            txt = await page.locator(xp).inner_text(timeout=2000)
+            txt = re.sub(r"\s+", " ", (txt or "")).strip()
+            if txt:
+                return txt
 
-            # (B) общий ряд с меткой
-            with suppress(Exception):
-                row = page.locator(
-                    \"xpath=(//*[contains(normalize-space(.),'Etap postępowania') or "
-                    \"contains(normalize-space(.),'Etap postepowania') or "
-                    \"contains(normalize-space(.),'Status sprawy') or "
-                    \"contains(normalize-space(.),'Stage of proceedings')])[1]"
-                    \"/ancestor::*[self::tr or self::div[contains(@class,'row') or contains(@class,'form')]][1]\"
-                )
-                txt = await row.inner_text(timeout=2000)
-                txt = re.sub(r\".*?(Etap post[ęe]powania|Status sprawy|Stage of proceedings)\\s*\", \"\", txt, flags=re.I|re.S)
-                txt = re.split(r\"\\n+\", txt, 1)[0]
-                txt = re.sub(r\"\\s+\", \" \", txt).strip()
-                if txt: return txt
+# (B) Любая разметка: ближайший ряд с меткой и значение после неё
+with suppress(Exception):
+    row = page.locator(
+        "xpath=(//*[contains(normalize-space(.),'Etap postępowania') or "
+        "contains(normalize-space(.),'Etap postepowania') or "
+        "contains(normalize-space(.),'Status sprawy') or "
+        "contains(normalize-space(.),'Stage of proceedings')])[1]"
+        "/ancestor::*[self::tr or self::div[contains(@class,'row') or contains(@class,'form')]][1]"
+    )
+    txt = await row.inner_text(timeout=2000)
+    txt = re.sub(r".*?(Etap post[ęe]powania|Status sprawy|Stage of proceedings)\s*", "", txt, flags=re.I|re.S)
+    txt = re.split(r"\n+", txt, 1)[0]
+    txt = re.sub(r"\s+", " ", txt).strip()
+    if txt:
+        return txt
 
-            # (C) запасные селекторы
-            selectors = [
-                \"xpath=(//*[contains(normalize-space(.),'Etap postępowania')])[1]/following::*[self::span|self::div|self::td|self::p][1]\",
-                \"[data-test*='etap' i], [data-testid*='etap' i]\",
-                \"xpath=(//*[matches(translate(normalize-space(.),'ĄĆĘŁŃÓŚŹŻąćęłńóśźż','ACELNOSZZacelnoszz'),'Etap postepowania|Status sprawy|Stage of proceedings')])[1]/following::*[self::span|self::div|self::td|self::p][1]\",
-            ]
-            for sel in selectors:
-                with suppress(Exception):
-                    txt = await page.locator(sel).inner_text(timeout=2000)
-                    txt = re.sub(r\"\\s+\", \" \", (txt or \"\")).strip()
-                    if txt: return txt
+# (C) Запасные селекторы
+selectors = [
+    "xpath=(//*[contains(normalize-space(.),'Etap postępowania')])[1]/following::*[self::span|self::div|self::td|self::p][1]",
+    "[data-test*='etap' i], [data-testid*='etap' i]",
+    "xpath=(//*[matches(translate(normalize-space(.),'ĄĆĘŁŃÓŚŹŻąćęłńóśźż','ACELNOSZZacelnoszz'),'Etap postepowania|Status sprawy|Stage of proceedings')])[1]/following::*[self::span|self::div|self::td|self::p][1]",
+]
+for sel in selectors:
+    with suppress(Exception):
+        txt = await page.locator(sel).inner_text(timeout=2000)
+        txt = re.sub(r"\s+", " ", (txt or "")).strip()
+        if txt:
+            return txt
 
             img = await page.screenshot(full_page=True)
             return (\"screenshot\", img)
