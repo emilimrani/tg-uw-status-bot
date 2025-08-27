@@ -1,2 +1,4 @@
 python-telegram-bot[webhooks]==21.6
 playwright==1.47.0
+psycopg2-binary==2.9.9
+cryptography==42.0.5
