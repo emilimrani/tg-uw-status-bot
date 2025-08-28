@@ -82,6 +82,7 @@ def db():
     return psycopg2.connect(DATABASE_URL, sslmode="require", cursor_factory=RealDictCursor)
 
 def ensure_schema():
+    # Схему оставляем прежней (с колонкой alerts), но просто не используем её.
     with db() as conn, conn.cursor() as cur:
         cur.execute("""
             create table if not exists users (
@@ -99,7 +100,7 @@ def ensure_schema():
 class Creds:
     case_no: str
     password: str
-    alerts: bool
+    alerts: bool  # не используется, оставлено для совместимости
 
 def get_creds(telegram_id: int) -> Creds | None:
     with db() as conn, conn.cursor() as cur:
@@ -120,11 +121,6 @@ def upsert_creds(telegram_id: int, case_no: str, password: str):
             on conflict (telegram_id) do update set
               case_enc=excluded.case_enc, pass_enc=excluded.pass_enc, updated_at=now();
         """, (telegram_id, enc(case_no), enc(password)))
-        conn.commit()
-
-def set_alerts(telegram_id: int, enabled: bool):
-    with db() as conn, conn.cursor() as cur:
-        cur.execute("update users set alerts=%s, updated_at=now() where telegram_id=%s", (enabled, telegram_id))
         conn.commit()
 
 def delete_user(telegram_id: int):
@@ -153,12 +149,8 @@ async def _click_first_that_works(page, locators_factories):
             last_err = e
     raise RuntimeError("Не получилось нажать кнопку входа. Детали: " + str(last_err))
 
-# --- ВАЖНО: исправленный парсер Vaadin-страницы ---
+# --- Парсер Vaadin-страницы: берём value у vaadin-text-field рядом с меткой ---
 async def _status_from_frame(frame: Frame) -> str | None:
-    """
-    Ищем метку 'Etap postępowania' и читаем значение из соседнего vaadin-text-field/area
-    (берём .value или атрибут value). Работает и с вариантами без диакритики.
-    """
     js = """
     () => {
       const norm = s => (s || "")
@@ -171,7 +163,6 @@ async def _status_from_frame(frame: Frame) -> str | None:
 
       const labelsWanted = ["etap postepowania","status sprawy","stage of proceedings"];
 
-      // 1) обычный путь: <label>Etap postępowania</label> + поле справа
       const labels = Array.from(document.querySelectorAll("label"));
       for (const lb of labels) {
         const t = norm(lb.innerText);
@@ -181,7 +172,6 @@ async def _status_from_frame(frame: Frame) -> str | None:
         const sel = "vaadin-text-field,vaadin-text-area,input,textarea,select,[value]";
         const candidates = Array.from(row.querySelectorAll(sel));
 
-        // на всякий случай — заглянем в несколько соседей после метки
         let sib = lb.parentElement;
         for (let i=0; i<4 && sib; i++) {
           sib = sib.nextElementSibling;
@@ -198,7 +188,6 @@ async def _status_from_frame(frame: Frame) -> str | None:
         }
       }
 
-      // 2) запасной путь: ищем узел с текстом и берём ближайшее поле
       const textNodes = Array.from(document.querySelectorAll("*"))
         .filter(n => labelsWanted.some(w => norm(n.textContent).includes(w)));
       for (const n of textNodes) {
@@ -212,7 +201,6 @@ async def _status_from_frame(frame: Frame) -> str | None:
           if (v) return v;
         }
       }
-
       return null;
     }
     """
@@ -224,10 +212,6 @@ async def _status_from_frame(frame: Frame) -> str | None:
 
 # ---------- Scraper ----------
 async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
-    """
-    Логинится, ищет 'Etap postępowania' в каждом frame и возвращает текст.
-    Если не нашлось — отдаёт скрин.
-    """
     if not BROWSERLESS_WS:
         raise RuntimeError("BROWSERLESS_WS не задан.")
 
@@ -246,7 +230,6 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
         page = await context.new_page()
 
         try:
-            # 1) логин
             await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
 
             with suppress(Exception):
@@ -268,7 +251,6 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
             ])
 
             await page.wait_for_load_state("domcontentloaded", timeout=45000)
-            # Дадим Vaadin дорисоваться
             with suppress(Exception):
                 await page.locator("label:has-text('Etap post')").first.wait_for(timeout=15000)
 
@@ -276,12 +258,10 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
                 err = await page.get_by_text(re.compile(r"(błędne|nieprawidłow).*hasł|logow|błąd logowania", re.I)).inner_text(timeout=1500)
                 if err: raise RuntimeError("Błąd logowania: sprawdź numer sprawy и hasło.")
 
-            # 2) главный документ
             status = await _status_from_frame(page.main_frame)
             if status:
                 return status
 
-            # 3) iframe'ы (если будут)
             for fr in page.frames:
                 if fr is page.main_frame:
                     continue
@@ -290,7 +270,6 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
                     if status:
                         return status
 
-            # 4) если не нашли — скрин
             img = await page.screenshot(full_page=True)
             return ("screenshot", img)
 
@@ -302,14 +281,10 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
 # ---------- UI ----------
 AWAIT_CASE, AWAIT_PASS = range(2)
 
-def main_kb(has_creds: bool, alerts: bool) -> InlineKeyboardMarkup:
+def main_kb(has_creds: bool) -> InlineKeyboardMarkup:
     rows = []
     if has_creds:
         rows.append([InlineKeyboardButton("🔍 Проверить статус", callback_data="check")])
-        rows.append([InlineKeyboardButton(
-            "🔔 Уведомления: ВКЛ" if alerts else "🔕 Уведомления: ВЫКЛ",
-            callback_data="alerts_toggle"
-        )])
         rows.append([InlineKeyboardButton("🔑 Изменить данные", callback_data="connect")])
         rows.append([InlineKeyboardButton("🗑 Удалить данные", callback_data="unlink")])
     else:
@@ -326,7 +301,7 @@ async def greet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Данные шифруются, их можно удалить одной кнопкой."
     )
     await update.message.reply_text(text, parse_mode="Markdown",
-        reply_markup=main_kb(bool(creds), creds.alerts if creds else False))
+        reply_markup=main_kb(bool(creds)))
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -335,129 +310,3 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "connect":
-        context.user_data["connect"] = {}
-        await safe_edit_or_send(query, "Введи *номер дела* (Numer sprawy):", parse_mode="Markdown")
-        return AWAIT_CASE
-
-    if data == "check":
-        creds = get_creds(uid)
-        if not creds:
-            await safe_edit_or_send(query, "Сначала подключи дело: нажми «🔑 Подключить дело».",
-                                    reply_markup=main_kb(False, False))
-            return ConversationHandler.END
-
-        await safe_edit_or_send(query, "⏳ Проверяю статус...")
-        try:
-            res = await asyncio.wait_for(fetch_status(creds.case_no, creds.password), timeout=55)
-            if isinstance(res, tuple) and res[0] == "screenshot":
-                await safe_edit_or_send(query, "Не нашёл текст статуса — отправляю скриншот страницы ниже.",
-                                        reply_markup=main_kb(True, creds.alerts))
-                with suppress(Exception):
-                    await query.message.reply_photo(InputFile(io.BytesIO(res[1]), filename="status.png"))
-            else:
-                await safe_edit_or_send(query, f"📌 Etap postępowania: *{safe_markdown(res)}*",
-                                        parse_mode="Markdown", reply_markup=main_kb(True, creds.alerts))
-        except asyncio.TimeoutError:
-            await safe_edit_or_send(query, "⚠️ Сайт не ответил за 55 сек. Попробуй ещё раз позже.",
-                                    reply_markup=main_kb(True, creds.alerts))
-        except Exception as e:
-            await safe_edit_or_send(query, f"⚠️ {e}", reply_markup=main_kb(True, creds.alerts))
-        return ConversationHandler.END
-
-    if data == "alerts_toggle":
-        creds = get_creds(uid)
-        if not creds:
-            await safe_edit_or_send(query, "Сначала подключи дело.", reply_markup=main_kb(False, False))
-            return ConversationHandler.END
-        new_state = not creds.alerts
-        set_alerts(uid, new_state)
-        if new_state:
-            context.job_queue.run_repeating(check_job, interval=6*60*60, first=10, name=f"alert_{uid}", data=uid)
-        else:
-            for job in context.job_queue.get_jobs_by_name(f"alert_{uid}"):
-                job.schedule_removal()
-        await safe_edit_or_send(query,
-            "Уведомления " + ("включены. Я буду проверять статус каждые ~6 часов." if new_state else "выключены."),
-            reply_markup=main_kb(True, new_state))
-        return ConversationHandler.END
-
-    if data == "unlink":
-        delete_user(uid)
-        for job in context.job_queue.get_jobs_by_name(f"alert_{uid}"):
-            job.schedule_removal()
-        await safe_edit_or_send(query, "Данные удалены. Нажми «🔑 Подключить дело», чтобы добавить заново.",
-                                reply_markup=main_kb(False, False))
-        return ConversationHandler.END
-
-    return ConversationHandler.END
-
-async def ask_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    case_no = update.message.text.strip()
-    context.user_data["connect"]["case_no"] = case_no
-    await update.message.reply_text("Принято. Теперь отправь *пароль* (Hasło):", parse_mode="Markdown")
-    return AWAIT_PASS
-
-async def save_creds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    pwd = update.message.text.strip()
-    case_no = context.user_data.get("connect", {}).get("case_no")
-    if not case_no:
-        await update.message.reply_text("Что-то пошло не так. Нажми «🔑 Подключить дело» и начни заново.",
-                                        reply_markup=main_kb(False, False))
-        return ConversationHandler.END
-    upsert_creds(uid, case_no, pwd)
-    await update.message.reply_text("Готово! Данные сохранены.\nТеперь просто жми «🔍 Проверить статус».",
-                                    reply_markup=main_kb(True, False))
-    return ConversationHandler.END
-
-async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Окей, отменил.", reply_markup=main_kb(False, False))
-    return ConversationHandler.END
-
-# ---------- Background job ----------
-async def check_job(context: ContextTypes.DEFAULT_TYPE):
-    uid = context.job.data
-    creds = get_creds(uid)
-    if not creds or not creds.alerts:
-        return
-    try:
-        res = await fetch_status(creds.case_no, creds.password)
-        if isinstance(res, tuple) and res[0] == "screenshot":
-            await context.bot.send_message(chat_id=uid, text="🔔 Не нашёл текст статуса — отправляю скриншот.")
-            with suppress(Exception):
-                await context.bot.send_photo(chat_id=uid, photo=InputFile(io.BytesIO(res[1]), filename="status.png"))
-        else:
-            await context.bot.send_message(chat_id=uid, text=f"🔔 Обновление статуса:\n📌 *{safe_markdown(res)}*",
-                                           parse_mode="Markdown", reply_markup=main_kb(True, True))
-    except Exception as e:
-        await context.bot.send_message(chat_id=uid, text=f"⚠️ Не удалось проверить статус: {e}",
-                                       reply_markup=main_kb(True, True))
-
-# ---------- main ----------
-def main():
-    if not TELEGRAM_TOKEN: raise SystemExit("TELEGRAM_TOKEN не задан.")
-    if not PUBLIC_URL or not PUBLIC_URL.startswith("https://"): raise SystemExit("PUBLIC_URL должен начинаться с https://")
-    if not WEBHOOK_SECRET_TOKEN: raise SystemExit("WEBHOOK_SECRET_TOKEN не задан.")
-    ensure_schema()
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", greet))
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(on_button)],
-        states={ AWAIT_CASE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_pass)],
-                 AWAIT_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_creds)] },
-        fallbacks=[CommandHandler("cancel", cancel_conv)],
-        map_to_parent={},
-    )
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(on_button))
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_PATH,
-        webhook_url=f"{PUBLIC_URL.rstrip('/')}/{WEBHOOK_PATH}",
-        secret_token=WEBHOOK_SECRET_TOKEN,
-        drop_pending_updates=True,
-    )
-
-if __name__ == "__main__":
-    main()
