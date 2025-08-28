@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import re
 import io
@@ -45,7 +46,11 @@ log = logging.getLogger("bot")
 
 # ---------- helpers ----------
 def safe_markdown(text: str) -> str:
-    return text.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
+    return (
+        text.replace("_", "\\_")
+        .replace("*", "\\*")
+        .replace("`", "\\`")
+    )
 
 async def safe_edit_or_send(query, text, reply_markup=None, parse_mode="Markdown"):
     try:
@@ -82,7 +87,6 @@ def db():
     return psycopg2.connect(DATABASE_URL, sslmode="require", cursor_factory=RealDictCursor)
 
 def ensure_schema():
-    # Схему оставляем прежней (с колонкой alerts), но просто не используем её.
     with db() as conn, conn.cursor() as cur:
         cur.execute("""
             create table if not exists users (
@@ -100,7 +104,7 @@ def ensure_schema():
 class Creds:
     case_no: str
     password: str
-    alerts: bool  # не используется, оставлено для совместимости
+    alerts: bool  # для совместимости, не используем
 
 def get_creds(telegram_id: int) -> Creds | None:
     with db() as conn, conn.cursor() as cur:
@@ -256,7 +260,8 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
 
             with suppress(Exception):
                 err = await page.get_by_text(re.compile(r"(błędne|nieprawidłow).*hasł|logow|błąd logowania", re.I)).inner_text(timeout=1500)
-                if err: raise RuntimeError("Błąd logowania: sprawdź numer sprawy и hasło.")
+                if err:
+                    raise RuntimeError("Błąd logowania: sprawdź numer sprawy и hasło.")
 
             status = await _status_from_frame(page.main_frame)
             if status:
@@ -310,3 +315,116 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "connect":
+        context.user_data["connect"] = {}
+        await safe_edit_or_send(query, "Введи *номер дела* (Numer sprawy):", parse_mode="Markdown")
+        return AWAIT_CASE
+
+    if data == "check":
+        creds = get_creds(uid)
+        if not creds:
+            await safe_edit_or_send(
+                query,
+                "Сначала подключи дело: нажми «🔑 Подключить дело».",
+                reply_markup=main_kb(False),
+            )
+            return ConversationHandler.END
+
+        await safe_edit_or_send(query, "⏳ Проверяю статус...")
+        try:
+            res = await asyncio.wait_for(fetch_status(creds.case_no, creds.password), timeout=55)
+            if isinstance(res, tuple) and res[0] == "screenshot":
+                await safe_edit_or_send(
+                    query,
+                    "Не нашёл текст статуса — отправляю скриншот страницы ниже.",
+                    reply_markup=main_kb(True),
+                )
+                with suppress(Exception):
+                    await query.message.reply_photo(InputFile(io.BytesIO(res[1]), filename="status.png"))
+            else:
+                await safe_edit_or_send(
+                    query,
+                    f"📌 Etap postępowania: *{safe_markdown(res)}*",
+                    parse_mode="Markdown",
+                    reply_markup=main_kb(True),
+                )
+        except asyncio.TimeoutError:
+            await safe_edit_or_send(
+                query,
+                "⚠️ Сайт не ответил за 55 сек. Попробуй ещё раз позже.",
+                reply_markup=main_kb(True),
+            )
+        except Exception as e:
+            await safe_edit_or_send(query, f"⚠️ {e}", reply_markup=main_kb(True))
+        return ConversationHandler.END
+
+    if data == "unlink":
+        delete_user(uid)
+        await safe_edit_or_send(
+            query,
+            "Данные удалены. Нажми «🔑 Подключить дело», чтобы добавить заново.",
+            reply_markup=main_kb(False),
+        )
+        return ConversationHandler.END
+
+    return ConversationHandler.END
+
+async def ask_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    case_no = update.message.text.strip()
+    context.user_data["connect"]["case_no"] = case_no
+    await update.message.reply_text("Принято. Теперь отправь *пароль* (Hasło):", parse_mode="Markdown")
+    return AWAIT_PASS
+
+async def save_creds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    pwd = update.message.text.strip()
+    case_no = context.user_data.get("connect", {}).get("case_no")
+    if not case_no:
+        await update.message.reply_text(
+            "Что-то пошло не так. Нажми «🔑 Подключить дело» и начни заново.",
+            reply_markup=main_kb(False),
+        )
+        return ConversationHandler.END
+    upsert_creds(uid, case_no, pwd)
+    await update.message.reply_text(
+        "Готово! Данные сохранены.\nТеперь просто жми «🔍 Проверить статус».",
+        reply_markup=main_kb(True),
+    )
+    return ConversationHandler.END
+
+async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Окей, отменил.", reply_markup=main_kb(False))
+    return ConversationHandler.END
+
+# ---------- main ----------
+def main():
+    if not TELEGRAM_TOKEN:
+        raise SystemExit("TELEGRAM_TOKEN не задан.")
+    if not PUBLIC_URL or not PUBLIC_URL.startswith("https://"):
+        raise SystemExit("PUBLIC_URL должен начинаться с https://")
+    if not WEBHOOK_SECRET_TOKEN:
+        raise SystemExit("WEBHOOK_SECRET_TOKEN не задан.")
+    ensure_schema()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", greet))
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(on_button)],
+        states={
+            AWAIT_CASE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_pass)],
+            AWAIT_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_creds)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+        map_to_parent={},
+    )
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH,
+        webhook_url=f"{PUBLIC_URL.rstrip('/')}/{WEBHOOK_PATH}",
+        secret_token=WEBHOOK_SECRET_TOKEN,
+        drop_pending_updates=True,
+    )
+
+if __name__ == "__main__":
+    main()
