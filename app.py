@@ -25,7 +25,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout, Frame
 
 # ---------- ENV ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -132,123 +132,7 @@ def delete_user(telegram_id: int):
         cur.execute("delete from users where telegram_id=%s", (telegram_id,))
         conn.commit()
 
-# ---------- Scraper (минималистичный и жёсткий) ----------
-async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
-    """
-    Логинится, находит строку с меткой 'Etap postępowania' в таблице
-    и возвращает текст из соседней ячейки. Если не нашёл — возвращает скрин.
-    """
-    if not BROWSERLESS_WS:
-        raise RuntimeError("BROWSERLESS_WS не задан.")
-
-    async with async_playwright() as p:
-        try:
-            browser = await p.chromium.connect_over_cdp(BROWSERLESS_WS)
-        except Exception as e:
-            raise RuntimeError("Не удаётся подключиться к удалённому браузеру: " + str(e))
-
-        context = await browser.new_context(
-            locale="pl-PL",
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"),
-            ignore_https_errors=True,
-        )
-        page = await context.new_page()
-
-        try:
-            # 1) страница логина
-            await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
-
-            with suppress(Exception):
-                await page.get_by_role("button", name=re.compile("Akceptuj|Zgadzam|Accept|Zgoda", re.I)).click(timeout=2000)
-
-            # 2) ввод логина/пароля
-            await _fill_first_that_works(page, [
-                lambda: page.get_by_label(re.compile(r"Numer sprawy", re.I)),
-                lambda: page.locator("input[name*='numer' i], input[id*='numer' i]"),
-            ], case_no)
-
-            await _fill_first_that_works(page, [
-                lambda: page.get_by_label(re.compile(r"Hasło", re.I)),
-                lambda: page.locator("input[type='password']"),
-            ], password)
-
-            # 3) вход
-            await _click_first_that_works(page, [
-                lambda: page.get_by_role("button", name=re.compile(r"Zaloguj|Log in|Zaloguj się", re.I)),
-                lambda: page.locator("button[type='submit'],input[type='submit']"),
-            ])
-
-            await page.wait_for_load_state("domcontentloaded", timeout=45000)
-
-            # 4) явные ошибки логина
-            with suppress(Exception):
-                err = await page.get_by_text(re.compile(r"(błędne|nieprawidłow).*hasł|logow|błąd logowania", re.I)).inner_text(timeout=1500)
-                if err: raise RuntimeError("Błąd logowania: sprawdź numer sprawy и hasło.")
-
-            # 5) ждём появления метки на странице (чтобы не скрапить ранo)
-            await page.wait_for_selector("text=Etap postępowania", timeout=10000)
-
-            # 6) берём значение строго из соседней ячейки той же строки
-            status_text = await page.evaluate("""
-                () => {
-                  const norm = s => (s || "")
-                    .toString()
-                    .normalize("NFKD")
-                    .replace(/[\\u0300-\\u036f]/g, "")
-                    .toLowerCase()
-                    .trim();
-
-                  const want = "etap postepowania";
-
-                  // табличные строки
-                  const rows = Array.from(document.querySelectorAll("tr"));
-                  for (const tr of rows) {
-                    const cells = Array.from(tr.querySelectorAll("th,td"));
-                    if (!cells.length) continue;
-                    for (let i = 0; i < cells.length; i++) {
-                      const t = norm(cells[i].innerText);
-                      if (t.includes(want)) {
-                        for (let j = i + 1; j < cells.length; j++) {
-                          const txt = (cells[j].innerText || "").replace(/\\s+/g, " ").trim();
-                          if (txt) return txt;
-                        }
-                      }
-                    }
-                  }
-
-                  // dl/dt/dd
-                  const dls = Array.from(document.querySelectorAll("dl"));
-                  for (const dl of dls) {
-                    const dts = Array.from(dl.querySelectorAll("dt"));
-                    const dds = Array.from(dl.querySelectorAll("dd"));
-                    for (let i = 0; i < dts.length; i++) {
-                      const t = norm(dts[i].innerText);
-                      if (t.includes(want)) {
-                        const dd = dds[i] || dts[i].nextElementSibling;
-                        if (dd) {
-                          const txt = (dd.innerText || "").replace(/\\s+/g, " ").trim();
-                          if (txt) return txt;
-                        }
-                      }
-                    }
-                  }
-
-                  return null;
-                }
-            """)
-
-            if status_text:
-                return re.sub(r"\s+", " ", status_text).strip()
-
-            img = await page.screenshot(full_page=True)
-            return ("screenshot", img)
-
-        except PlaywrightTimeout:
-            raise RuntimeError("Портал не отвечает или работает медленно. Попробуйте позже.")
-        finally:
-            await context.close()
-
+# ---------- Scraper ----------
 async def _fill_first_that_works(page, locators_factories, value: str):
     last_err = None
     for lf in locators_factories:
@@ -268,6 +152,130 @@ async def _click_first_that_works(page, locators_factories):
         except Exception as e:
             last_err = e
     raise RuntimeError("Не получилось нажать кнопку входа. Детали: " + str(last_err))
+
+async def _status_from_frame(frame: Frame) -> str | None:
+    """Пытаемся достать статус ТОЛЬКО из таблиц/списков внутри конкретного фрейма."""
+    # Вариант 1: жёсткий XPath по таблицам
+    labels = ["Etap postępowania", "Etap postepowania", "Status sprawy", "Stage of proceedings"]
+    for lab in labels:
+        for xp in [
+            f"xpath=//tr[.//td[normalize-space()='{lab}'] or .//th[normalize-space()='{lab}']]//td[position()>1][1]",
+            f"xpath=//td[normalize-space()='{lab}']/following-sibling::td[1]",
+            f"xpath=//th[normalize-space()='{lab}']/following-sibling::td[1]",
+        ]:
+            with suppress(Exception):
+                txt = await frame.locator(xp).inner_text(timeout=1500)
+                txt = re.sub(r"\s+", " ", (txt or "")).strip()
+                if txt:
+                    return txt
+
+    # Вариант 2: <dl><dt>/<dd>
+    with suppress(Exception):
+        txt = await frame.evaluate("""
+            () => {
+              const norm = s => (s || "").toString().normalize("NFKD")
+                  .replace(/[\\u0300-\\u036f]/g,"").toLowerCase().trim();
+              const labels = ["etap postepowania","status sprawy","stage of proceedings"];
+              const dls = Array.from(document.querySelectorAll("dl"));
+              for (const dl of dls) {
+                const dts = Array.from(dl.querySelectorAll("dt"));
+                const dds = Array.from(dl.querySelectorAll("dd"));
+                for (let i=0;i<dts.length;i++){
+                  const t = norm(dts[i].innerText);
+                  if (labels.some(l=>t.includes(l))) {
+                    const dd = dds[i] || dts[i].nextElementSibling;
+                    if (dd) {
+                      const raw = (dd.innerText||"").replace(/\\s+/g," ").trim();
+                      if (raw) return raw;
+                    }
+                  }
+                }
+              }
+              return null;
+            }
+        """)
+        if txt:
+            return re.sub(r"\s+", " ", txt).strip()
+
+    return None
+
+async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
+    """
+    Логинится, ищет строку 'Etap postępowania' в любом frame на странице
+    и возвращает текст из соседней ячейки. Если не нашлось — даёт скрин.
+    """
+    if not BROWSERLESS_WS:
+        raise RuntimeError("BROWSERLESS_WS не задан.")
+
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.connect_over_cdp(BROWSERLESS_WS)
+        except Exception as e:
+            raise RuntimeError("Не удаётся подключиться к удалённому браузеру: " + str(e))
+
+        context = await browser.new_context(
+            locale="pl-PL",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"),
+            ignore_https_errors=True,
+        )
+        page = await context.new_page()
+
+        try:
+            # 1) логин
+            await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
+
+            with suppress(Exception):
+                await page.get_by_role("button", name=re.compile("Akceptuj|Zgadzam|Accept|Zgoda", re.I)).click(timeout=2000)
+
+            await _fill_first_that_works(page, [
+                lambda: page.get_by_label(re.compile(r"Numer sprawy", re.I)),
+                lambda: page.locator("input[name*='numer' i], input[id*='numer' i]"),
+            ], case_no)
+
+            await _fill_first_that_works(page, [
+                lambda: page.get_by_label(re.compile(r"Hasło", re.I)),
+                lambda: page.locator("input[type='password']"),
+            ], password)
+
+            await _click_first_that_works(page, [
+                lambda: page.get_by_role("button", name=re.compile(r"Zaloguj|Log in|Zaloguj się", re.I)),
+                lambda: page.locator("button[type='submit'],input[type='submit']"),
+            ])
+
+            await page.wait_for_load_state("domcontentloaded", timeout=45000)
+
+            with suppress(Exception):
+                err = await page.get_by_text(re.compile(r"(błędne|nieprawidłow).*hasł|logow|błąd logowania", re.I)).inner_text(timeout=1500)
+                if err: raise RuntimeError("Błąd logowania: sprawdź numer sprawy и hasło.")
+
+            # 2) пытаемся получить статус в главном фрейме
+            status = await _status_from_frame(page.main_frame)
+            if status:
+                return status
+
+            # 3) обходим ВСЕ iframe'ы
+            for fr in page.frames:
+                if fr is page.main_frame:
+                    continue
+                with suppress(Exception):
+                    # маленькая проверка, что фрейм реально содержит нужную метку
+                    if await fr.locator("text=Etap postępowania").count() == 0:
+                        # возможно без диакритики или на англ/PL без ę
+                        if await fr.locator("text=Etap postepowania, text=Status sprawy").count() == 0:
+                            continue
+                    status = await _status_from_frame(fr)
+                    if status:
+                        return status
+
+            # 4) если не нашли — скрин
+            img = await page.screenshot(full_page=True)
+            return ("screenshot", img)
+
+        except PlaywrightTimeout:
+            raise RuntimeError("Портал не отвечает или работает медленно. Попробуйте позже.")
+        finally:
+            await context.close()
 
 # ---------- UI ----------
 AWAIT_CASE, AWAIT_PASS = range(2)
@@ -318,8 +326,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await safe_edit_or_send(query, "⏳ Проверяю статус...")
         try:
-            # Жёсткий общий таймаут на весь скрапинг,
-            # чтобы кнопка не «висела» бесконечно
             res = await asyncio.wait_for(fetch_status(creds.case_no, creds.password), timeout=55)
             if isinstance(res, tuple) and res[0] == "screenshot":
                 await safe_edit_or_send(query, "Не нашёл текст статуса — отправляю скриншот страницы ниже.",
