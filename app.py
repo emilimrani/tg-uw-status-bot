@@ -132,7 +132,7 @@ def delete_user(telegram_id: int):
         cur.execute("delete from users where telegram_id=%s", (telegram_id,))
         conn.commit()
 
-# ---------- Scraper ----------
+# ---------- Scraper helpers ----------
 async def _fill_first_that_works(page, locators_factories, value: str):
     last_err = None
     for lf in locators_factories:
@@ -153,56 +153,80 @@ async def _click_first_that_works(page, locators_factories):
             last_err = e
     raise RuntimeError("Не получилось нажать кнопку входа. Детали: " + str(last_err))
 
+# --- ВАЖНО: исправленный парсер Vaadin-страницы ---
 async def _status_from_frame(frame: Frame) -> str | None:
-    """Пытаемся достать статус ТОЛЬКО из таблиц/списков внутри конкретного фрейма."""
-    # Вариант 1: жёсткий XPath по таблицам
-    labels = ["Etap postępowania", "Etap postepowania", "Status sprawy", "Stage of proceedings"]
-    for lab in labels:
-        for xp in [
-            f"xpath=//tr[.//td[normalize-space()='{lab}'] or .//th[normalize-space()='{lab}']]//td[position()>1][1]",
-            f"xpath=//td[normalize-space()='{lab}']/following-sibling::td[1]",
-            f"xpath=//th[normalize-space()='{lab}']/following-sibling::td[1]",
-        ]:
-            with suppress(Exception):
-                txt = await frame.locator(xp).inner_text(timeout=1500)
-                txt = re.sub(r"\s+", " ", (txt or "")).strip()
-                if txt:
-                    return txt
+    """
+    Ищем метку 'Etap postępowania' и читаем значение из соседнего vaadin-text-field/area
+    (берём .value или атрибут value). Работает и с вариантами без диакритики.
+    """
+    js = """
+    () => {
+      const norm = s => (s || "")
+        .toString()
+        .normalize("NFKD")
+        .replace(/[\\u0300-\\u036f]/g,"")
+        .toLowerCase()
+        .replace(/\\s+/g," ")
+        .trim();
 
-    # Вариант 2: <dl><dt>/<dd>
+      const labelsWanted = ["etap postepowania","status sprawy","stage of proceedings"];
+
+      // 1) обычный путь: <label>Etap postępowania</label> + поле справа
+      const labels = Array.from(document.querySelectorAll("label"));
+      for (const lb of labels) {
+        const t = norm(lb.innerText);
+        if (!labelsWanted.some(w => t.includes(w))) continue;
+
+        const row = lb.closest("div")?.parentElement || lb.parentElement || document.body;
+        const sel = "vaadin-text-field,vaadin-text-area,input,textarea,select,[value]";
+        const candidates = Array.from(row.querySelectorAll(sel));
+
+        // на всякий случай — заглянем в несколько соседей после метки
+        let sib = lb.parentElement;
+        for (let i=0; i<4 && sib; i++) {
+          sib = sib.nextElementSibling;
+          if (sib) candidates.push(...sib.querySelectorAll(sel));
+        }
+
+        for (const el of candidates) {
+          let v = "";
+          if ("value" in el) v = el.value || "";
+          if (!v && el.getAttribute) v = el.getAttribute("value") || "";
+          if (!v) v = (el.textContent || "");
+          v = v.replace(/\\s+/g," ").trim();
+          if (v) return v;
+        }
+      }
+
+      // 2) запасной путь: ищем узел с текстом и берём ближайшее поле
+      const textNodes = Array.from(document.querySelectorAll("*"))
+        .filter(n => labelsWanted.some(w => norm(n.textContent).includes(w)));
+      for (const n of textNodes) {
+        const sel = "vaadin-text-field,vaadin-text-area,input,textarea,select,[value]";
+        const field = n.parentElement?.querySelector(sel)
+                  || n.closest("div")?.querySelector(sel)
+                  || n.ownerDocument.querySelector(sel);
+        if (field) {
+          let v = ("value" in field ? field.value : "") || field.getAttribute?.("value") || "";
+          v = (v || field.textContent || "").replace(/\\s+/g," ").trim();
+          if (v) return v;
+        }
+      }
+
+      return null;
+    }
+    """
     with suppress(Exception):
-        txt = await frame.evaluate("""
-            () => {
-              const norm = s => (s || "").toString().normalize("NFKD")
-                  .replace(/[\\u0300-\\u036f]/g,"").toLowerCase().trim();
-              const labels = ["etap postepowania","status sprawy","stage of proceedings"];
-              const dls = Array.from(document.querySelectorAll("dl"));
-              for (const dl of dls) {
-                const dts = Array.from(dl.querySelectorAll("dt"));
-                const dds = Array.from(dl.querySelectorAll("dd"));
-                for (let i=0;i<dts.length;i++){
-                  const t = norm(dts[i].innerText);
-                  if (labels.some(l=>t.includes(l))) {
-                    const dd = dds[i] || dts[i].nextElementSibling;
-                    if (dd) {
-                      const raw = (dd.innerText||"").replace(/\\s+/g," ").trim();
-                      if (raw) return raw;
-                    }
-                  }
-                }
-              }
-              return null;
-            }
-        """)
+        txt = await frame.evaluate(js)
         if txt:
             return re.sub(r"\s+", " ", txt).strip()
-
     return None
 
+# ---------- Scraper ----------
 async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
     """
-    Логинится, ищет строку 'Etap postępowania' в любом frame на странице
-    и возвращает текст из соседней ячейки. Если не нашлось — даёт скрин.
+    Логинится, ищет 'Etap postępowania' в каждом frame и возвращает текст.
+    Если не нашлось — отдаёт скрин.
     """
     if not BROWSERLESS_WS:
         raise RuntimeError("BROWSERLESS_WS не задан.")
@@ -244,26 +268,24 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
             ])
 
             await page.wait_for_load_state("domcontentloaded", timeout=45000)
+            # Дадим Vaadin дорисоваться
+            with suppress(Exception):
+                await page.locator("label:has-text('Etap post')").first.wait_for(timeout=15000)
 
             with suppress(Exception):
                 err = await page.get_by_text(re.compile(r"(błędne|nieprawidłow).*hasł|logow|błąd logowania", re.I)).inner_text(timeout=1500)
                 if err: raise RuntimeError("Błąd logowania: sprawdź numer sprawy и hasło.")
 
-            # 2) пытаемся получить статус в главном фрейме
+            # 2) главный документ
             status = await _status_from_frame(page.main_frame)
             if status:
                 return status
 
-            # 3) обходим ВСЕ iframe'ы
+            # 3) iframe'ы (если будут)
             for fr in page.frames:
                 if fr is page.main_frame:
                     continue
                 with suppress(Exception):
-                    # маленькая проверка, что фрейм реально содержит нужную метку
-                    if await fr.locator("text=Etap postępowania").count() == 0:
-                        # возможно без диакритики или на англ/PL без ę
-                        if await fr.locator("text=Etap postepowania, text=Status sprawy").count() == 0:
-                            continue
                     status = await _status_from_frame(fr)
                     if status:
                         return status
