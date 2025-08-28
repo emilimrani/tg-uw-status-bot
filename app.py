@@ -1,6 +1,7 @@
 import os
 import re
 import io
+import asyncio
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
@@ -131,10 +132,11 @@ def delete_user(telegram_id: int):
         cur.execute("delete from users where telegram_id=%s", (telegram_id,))
         conn.commit()
 
-# ---------- Scraper ----------
+# ---------- Scraper (минималистичный и жёсткий) ----------
 async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
     """
-    Возвращает текст статуса или ('screenshot', image_bytes), если текст не распарсился.
+    Логинится, находит строку с меткой 'Etap postępowania' в таблице
+    и возвращает текст из соседней ячейки. Если не нашёл — возвращает скрин.
     """
     if not BROWSERLESS_WS:
         raise RuntimeError("BROWSERLESS_WS не задан.")
@@ -143,10 +145,7 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
         try:
             browser = await p.chromium.connect_over_cdp(BROWSERLESS_WS)
         except Exception as e:
-            raise RuntimeError(
-                "Не удаётся подключиться к удалённому браузеру (Browserless). "
-                "Проверь BROWSERLESS_WS и лимиты плана. Детали: " + str(e)
-            )
+            raise RuntimeError("Не удаётся подключиться к удалённому браузеру: " + str(e))
 
         context = await browser.new_context(
             locale="pl-PL",
@@ -157,54 +156,40 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
         page = await context.new_page()
 
         try:
+            # 1) страница логина
             await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
 
             with suppress(Exception):
-                await page.get_by_role("button", name=re.compile("Akceptuj|Zgadzam|Accept|Zgoda", re.I)).click(timeout=3000)
+                await page.get_by_role("button", name=re.compile("Akceptuj|Zgadzam|Accept|Zgoda", re.I)).click(timeout=2000)
 
-            # Numer sprawy
-            filled = False
-            for locator in [
-                page.get_by_label(re.compile(r"Numer sprawy", re.I)),
-                page.get_by_placeholder(re.compile(r"Numer sprawy|Number of application", re.I)),
-                page.locator("input[name*='numer' i], input[id*='numer' i]"),
-            ]:
-                try:
-                    await locator.fill(case_no, timeout=3000); filled=True; break
-                except Exception: pass
-            if not filled: raise RuntimeError("Не нашёл поле 'Numer sprawy'.")
+            # 2) ввод логина/пароля
+            await _fill_first_that_works(page, [
+                lambda: page.get_by_label(re.compile(r"Numer sprawy", re.I)),
+                lambda: page.locator("input[name*='numer' i], input[id*='numer' i]"),
+            ], case_no)
 
-            # Hasło
-            filled = False
-            for locator in [
-                page.get_by_label(re.compile(r"Hasło", re.I)),
-                page.get_by_placeholder(re.compile(r"Hasło|Password", re.I)),
-                page.locator("input[type='password']"),
-            ]:
-                try:
-                    await locator.fill(password, timeout=3000); filled=True; break
-                except Exception: pass
-            if not filled: raise RuntimeError("Не нашёл поле 'Hasło'.")
+            await _fill_first_that_works(page, [
+                lambda: page.get_by_label(re.compile(r"Hasło", re.I)),
+                lambda: page.locator("input[type='password']"),
+            ], password)
 
-            # Zaloguj
-            clicked=False
-            for locator in [
-                page.get_by_role("button", name=re.compile(r"Zaloguj|Zalogować|Log in|Zaloguj się", re.I)),
-                page.locator("input[type='submit']"),
-                page.locator("button[type='submit']"),
-            ]:
-                try:
-                    await locator.click(timeout=3000); clicked=True; break
-                except Exception: pass
-            if not clicked: raise RuntimeError("Не удалось нажать 'Zaloguj'.")
+            # 3) вход
+            await _click_first_that_works(page, [
+                lambda: page.get_by_role("button", name=re.compile(r"Zaloguj|Log in|Zaloguj się", re.I)),
+                lambda: page.locator("button[type='submit'],input[type='submit']"),
+            ])
 
             await page.wait_for_load_state("domcontentloaded", timeout=45000)
 
+            # 4) явные ошибки логина
             with suppress(Exception):
                 err = await page.get_by_text(re.compile(r"(błędne|nieprawidłow).*hasł|logow|błąd logowania", re.I)).inner_text(timeout=1500)
                 if err: raise RuntimeError("Błąd logowania: sprawdź numer sprawy и hasło.")
 
-            # === ИЗВЛЕЧЕНИЕ СТАТУСА (строго из таблиц/списков) ===
+            # 5) ждём появления метки на странице (чтобы не скрапить ранo)
+            await page.wait_for_selector("text=Etap postępowania", timeout=10000)
+
+            # 6) берём значение строго из соседней ячейки той же строки
             status_text = await page.evaluate("""
                 () => {
                   const norm = s => (s || "")
@@ -212,54 +197,50 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
                     .normalize("NFKD")
                     .replace(/[\\u0300-\\u036f]/g, "")
                     .toLowerCase()
-                    .replace(/\\s+/g, " ")
                     .trim();
 
-                  const labels = ["etap postepowania", "status sprawy", "stage of proceedings"];
+                  const want = "etap postepowania";
 
-                  // 1) Таблицы: ищем строку, где первая ячейка содержит метку,
-                  // берём значение из следующей ячейки.
+                  // табличные строки
                   const rows = Array.from(document.querySelectorAll("tr"));
                   for (const tr of rows) {
                     const cells = Array.from(tr.querySelectorAll("th,td"));
                     if (!cells.length) continue;
                     for (let i = 0; i < cells.length; i++) {
                       const t = norm(cells[i].innerText);
-                      if (labels.some(l => t.includes(l))) {
-                        // значение — следующая непустая ячейка
+                      if (t.includes(want)) {
                         for (let j = i + 1; j < cells.length; j++) {
-                          const raw = (cells[j].innerText || "").trim();
-                          if (raw) return raw;
+                          const txt = (cells[j].innerText || "").replace(/\\s+/g, " ").trim();
+                          if (txt) return txt;
                         }
                       }
                     }
                   }
 
-                  // 2) <dl><dt>Label</dt><dd>Value</dd>
+                  // dl/dt/dd
                   const dls = Array.from(document.querySelectorAll("dl"));
                   for (const dl of dls) {
                     const dts = Array.from(dl.querySelectorAll("dt"));
                     const dds = Array.from(dl.querySelectorAll("dd"));
                     for (let i = 0; i < dts.length; i++) {
                       const t = norm(dts[i].innerText);
-                      if (labels.some(l => t.includes(l))) {
+                      if (t.includes(want)) {
                         const dd = dds[i] || dts[i].nextElementSibling;
                         if (dd) {
-                          const raw = (dd.innerText || "").trim();
-                          if (raw) return raw;
+                          const txt = (dd.innerText || "").replace(/\\s+/g, " ").trim();
+                          if (txt) return txt;
                         }
                       }
                     }
                   }
 
-                  return null; // ничего не нашли
+                  return null;
                 }
             """)
 
-            if status_text and isinstance(status_text, str):
+            if status_text:
                 return re.sub(r"\s+", " ", status_text).strip()
 
-            # Если не нашли — пришлём скриншот
             img = await page.screenshot(full_page=True)
             return ("screenshot", img)
 
@@ -267,6 +248,26 @@ async def fetch_status(case_no: str, password: str) -> str | tuple[str, bytes]:
             raise RuntimeError("Портал не отвечает или работает медленно. Попробуйте позже.")
         finally:
             await context.close()
+
+async def _fill_first_that_works(page, locators_factories, value: str):
+    last_err = None
+    for lf in locators_factories:
+        try:
+            await lf().fill(value, timeout=3000)
+            return
+        except Exception as e:
+            last_err = e
+    raise RuntimeError("Не нашёл поле ввода. Детали: " + str(last_err))
+
+async def _click_first_that_works(page, locators_factories):
+    last_err = None
+    for lf in locators_factories:
+        try:
+            await lf().click(timeout=3000)
+            return
+        except Exception as e:
+            last_err = e
+    raise RuntimeError("Не получилось нажать кнопку входа. Детали: " + str(last_err))
 
 # ---------- UI ----------
 AWAIT_CASE, AWAIT_PASS = range(2)
@@ -314,9 +315,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_or_send(query, "Сначала подключи дело: нажми «🔑 Подключить дело».",
                                     reply_markup=main_kb(False, False))
             return ConversationHandler.END
+
         await safe_edit_or_send(query, "⏳ Проверяю статус...")
         try:
-            res = await fetch_status(creds.case_no, creds.password)
+            # Жёсткий общий таймаут на весь скрапинг,
+            # чтобы кнопка не «висела» бесконечно
+            res = await asyncio.wait_for(fetch_status(creds.case_no, creds.password), timeout=55)
             if isinstance(res, tuple) and res[0] == "screenshot":
                 await safe_edit_or_send(query, "Не нашёл текст статуса — отправляю скриншот страницы ниже.",
                                         reply_markup=main_kb(True, creds.alerts))
@@ -325,6 +329,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await safe_edit_or_send(query, f"📌 Etap postępowania: *{safe_markdown(res)}*",
                                         parse_mode="Markdown", reply_markup=main_kb(True, creds.alerts))
+        except asyncio.TimeoutError:
+            await safe_edit_or_send(query, "⚠️ Сайт не ответил за 55 сек. Попробуй ещё раз позже.",
+                                    reply_markup=main_kb(True, creds.alerts))
         except Exception as e:
             await safe_edit_or_send(query, f"⚠️ {e}", reply_markup=main_kb(True, creds.alerts))
         return ConversationHandler.END
